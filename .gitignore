@@ -1,0 +1,21 @@
+# Ignore everything by default
+*
+
+# But do not ignore these specific folders/files
+!src/
+!src/**/*.js
+!package.json
+!package-lock.json
+
+# If you also want to track the HTML/CSS/Images needed to run the app, uncomment these:
+#!Context/
+#!Context/**/*.html
+#!Master pages/
+#!Master pages/**/*.html
+#!Stylesheets/
+#!Stylesheets/**/*.css
+#!images/
+#!images/**/*.pdf
+
+# Exclude git internals just in case
+!.gitignore
