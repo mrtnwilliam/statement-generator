@@ -1,7 +1,8 @@
 import { PDFDocument } from "pdf-lib";
 import fs from "fs";
+import { renderCardTransactions, renderCardOverlays } from "./renderHtml.js";
 
-export async function generatePDF(browser, bgPdfDoc, html, fileName, pageTypes = [], subFolder = "") {
+async function getPuppeteerPdf(browser, html, fileName, isOverlay = false) {
   let pdfBuffer = null;
   const maxRetries = 3;
   
@@ -12,63 +13,83 @@ export async function generatePDF(browser, bgPdfDoc, html, fileName, pageTypes =
       await page.setContent(html, { waitUntil: "load", timeout: 60000 });
       pdfBuffer = await page.pdf({
         format: "A4",
-        printBackground: true,
-        omitBackground: true,
+        printBackground: true, 
+        omitBackground: true,  
         timeout: 60000
       });
       await page.close();
-      break; // Success! Exit the retry loop.
+      return pdfBuffer;
     } catch (err) {
       if (page && !page.isClosed()) await page.close().catch(() => {});
-      console.error(`Attempt ${attempt} failed for ${fileName}: ${err.message}`);
-      if (attempt === maxRetries) throw err; // Throw on final failure
-      await new Promise(res => setTimeout(res, 2000)); // Wait before retry
+      console.error(`Attempt ${attempt} failed for ${fileName} (${isOverlay ? 'overlay' : 'tx'}): ${err.message}`);
+      if (attempt === maxRetries) throw err;
+      await new Promise(res => setTimeout(res, 2000));
     }
   }
-  
-  // Create a new final document
+}
+
+export async function generatePDF(browser, bgPdfDoc, customer, fileName, subFolder = "") {
+  // Create a new master document to hold all cards for this customer
   const finalPdfDoc = await PDFDocument.create();
-  
-  // Load the generated PDF just to get the page count
-  const generatedPdfDoc = await PDFDocument.load(pdfBuffer);
-  const pageCount = generatedPdfDoc.getPageCount();
 
-  // Embed the pages of the generated PDF into the final document
-  const pageIndices = Array.from({ length: pageCount }, (_, i) => i);
-  const embeddedPages = await finalPdfDoc.embedPdf(pdfBuffer, pageIndices);
-
-  // Only embed the background page XObjects that are actually used in this document
-  const needsRep  = pageTypes.some(t => t !== 'last');
-  const needsLast = pageTypes.some(t => t === 'last');
-
+  // Load the background XObjects once for this document
   const sourceBgRep  = bgPdfDoc.getPage(0);
   const sourceBgLast = bgPdfDoc.getPage(1);
+  const embeddedBgRep  = await finalPdfDoc.embedPage(sourceBgRep);
+  const embeddedBgLast = await finalPdfDoc.embedPage(sourceBgLast);
   const bgDimensions = sourceBgRep.getSize();
 
-  const embeddedBgRep  = needsRep  ? await finalPdfDoc.embedPage(sourceBgRep)  : null;
-  const embeddedBgLast = needsLast ? await finalPdfDoc.embedPage(sourceBgLast) : null;
-
-  for (let i = 0; i < pageCount; i++) {
-    const type = pageTypes[i] || (i === pageCount - 1 ? 'last' : 'rep');
-    const embeddedBg = type === 'last' ? embeddedBgLast : embeddedBgRep;
+  // Loop through all cards belonging to this customer
+  for (const [cardNo, card] of customer.cards) {
     
-    const newPage = finalPdfDoc.addPage([bgDimensions.width, bgDimensions.height]);
+    // 1. Render transaction HTML natively
+    const txHtml = renderCardTransactions(card);
+    const txBuffer = await getPuppeteerPdf(browser, txHtml, fileName, false);
+    
+    // Parse the generated transaction PDF just to discover Chrome's page count
+    const txPdfDoc = await PDFDocument.load(txBuffer);
+    const pageCount = txPdfDoc.getPageCount();
 
-    newPage.drawPage(embeddedBg, {
-      x: 0,
-      y: 0,
-      width: bgDimensions.width,
-      height: bgDimensions.height
-    });
+    // 2. Render overlays HTML optimally formatted for the discovered pageCount
+    const overlayHtml = renderCardOverlays(card, pageCount);
+    const overlayBuffer = await getPuppeteerPdf(browser, overlayHtml, fileName, true);
+    
+    // 3. Extract pages as XObjects 
+    const pageIndices = Array.from({ length: pageCount }, (_, i) => i);
+    const embeddedTxPages = await finalPdfDoc.embedPdf(txBuffer, pageIndices);
+    const embeddedOverlayPages = await finalPdfDoc.embedPdf(overlayBuffer, pageIndices);
 
-    const embeddedHtmlPage = embeddedPages[i];
+    // 4. Stamp them all together into the master document
+    for (let i = 0; i < pageCount; i++) {
+        const isAbsoluteLast = (i === pageCount - 1);
+        const embeddedBg = isAbsoluteLast ? embeddedBgLast : embeddedBgRep;
+        
+        const newPage = finalPdfDoc.addPage([bgDimensions.width, bgDimensions.height]);
 
-    newPage.drawPage(embeddedHtmlPage, {
-      x: 0,
-      y: 0,
-      width: newPage.getWidth(),
-      height: newPage.getHeight()
-    });
+        // Stamp 1: Background Template (repPage or lastPage image)
+        newPage.drawPage(embeddedBg, {
+          x: 0,
+          y: 0,
+          width: bgDimensions.width,
+          height: bgDimensions.height
+        });
+
+        // Stamp 2: Transactions (Text layout from Chrome)
+        newPage.drawPage(embeddedTxPages[i], {
+          x: 0,
+          y: 0,
+          width: newPage.getWidth(),
+          height: newPage.getHeight()
+        });
+
+        // Stamp 3: Overlays (Absolute HTML Template Overlays)
+        newPage.drawPage(embeddedOverlayPages[i], {
+          x: 0,
+          y: 0,
+          width: newPage.getWidth(),
+          height: newPage.getHeight()
+        });
+    }
   }
 
   // Ensure output directory exists before writing

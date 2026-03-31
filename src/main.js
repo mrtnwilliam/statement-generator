@@ -19,9 +19,7 @@ console.error = function (...args) {
   fileLogger.error(...args);
 };
 import { parseCSV } from "./parseCsv.js";
-import { renderCustomerStatements } from "./renderHtml.js";
 import { generatePDF } from "./pdfGenerator.js";
-import { measureRowsPerPage } from "./measureRows.js";
 
 async function main() {
   console.log("Initializing browser and shared resources...");
@@ -30,9 +28,6 @@ async function main() {
   const browser = await puppeteer.launch();
 
   try {
-    // Measure how many rows fit in the transaction area — runs only once!
-    const rowsPerPage = await measureRowsPerPage(browser);
-
     // Load and parse the background PDF template into a PDFDocument ONLY ONCE
     const bgPdfBytes = fs.readFileSync("images/VISAL_NewLogo_1.pdf");
     const parsedBgPdfDoc = await PDFDocument.load(bgPdfBytes);
@@ -69,11 +64,11 @@ async function main() {
         await Promise.all(
           batch.map(async ([cif, customer]) => {
             try {
-              const { html, pageTypes } = renderCustomerStatements(customer, rowsPerPage);
               const brNo = customer.cards.values().next().value.header.Br_No;
               const fileName = `${brNo}${cif}`;
               
-              await generatePDF(browser, parsedBgPdfDoc, html, fileName, pageTypes, subFolder);
+              // Now we pass the entire customer object to the generator so it can handle multi-card native pagination
+              await generatePDF(browser, parsedBgPdfDoc, customer, fileName, subFolder);
               console.log("Generated:", fileName);
             } catch (err) {
               console.error(`Error generating PDF for ${cif} in ${file}:`, err);
