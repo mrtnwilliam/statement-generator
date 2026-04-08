@@ -1,104 +1,101 @@
 import { PDFDocument } from "pdf-lib";
 import fs from "fs";
-import { renderCardTransactions, renderCardOverlays } from "./renderHtml.js";
+import { renderMassiveTransactions, renderMassiveOverlays } from "./renderHtml.js";
+import { createRequire } from "module";
+const require = createRequire(import.meta.url);
+const pdfParse = require("pdf-parse");
 
-async function getPuppeteerPdf(browser, html, fileName, isOverlay = false) {
-  let pdfBuffer = null;
+async function getPuppeteerPdf(browser, html, fileName, label = "tx") {
   const maxRetries = 3;
-  
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     let page;
     try {
       page = await browser.newPage();
       await page.setContent(html, { waitUntil: "load", timeout: 60000 });
-      pdfBuffer = await page.pdf({
+      const pdfResult = await page.pdf({
         format: "A4",
-        printBackground: true, 
-        omitBackground: true,  
+        printBackground: false,
         timeout: 60000
       });
       await page.close();
-      return pdfBuffer;
+      return Buffer.from(pdfResult); // Puppeteer v24 returns Uint8Array
     } catch (err) {
       if (page && !page.isClosed()) await page.close().catch(() => {});
-      console.error(`Attempt ${attempt} failed for ${fileName} (${isOverlay ? 'overlay' : 'tx'}): ${err.message}`);
+      console.error(`Attempt ${attempt} failed for ${fileName} (${label}): ${err.message}`);
       if (attempt === maxRetries) throw err;
       await new Promise(res => setTimeout(res, 2000));
     }
   }
 }
 
-export async function generatePDF(browser, bgPdfDoc, customer, fileName, subFolder = "") {
-  // Create a new master document to hold all cards for this customer
-  const finalPdfDoc = await PDFDocument.create();
+export async function generatePDF(browser, bgPdfBytes, customer, fileName, subFolder = "") {
+  const cardsArray = Array.from(customer.cards.values());
 
-  // Load the background XObjects once for this document
-  const sourceBgRep  = bgPdfDoc.getPage(0);
-  const sourceBgLast = bgPdfDoc.getPage(1);
-  const embeddedBgRep  = await finalPdfDoc.embedPage(sourceBgRep);
-  const embeddedBgLast = await finalPdfDoc.embedPage(sourceBgLast);
-  const bgDimensions = sourceBgRep.getSize();
+  // Phase 1: Render all transactions in one Chrome pass
+  const massiveTxHtml = renderMassiveTransactions(cardsArray);
+  const massiveTxBuffer = await getPuppeteerPdf(browser, massiveTxHtml, fileName, "tx");
 
-  // Loop through all cards belonging to this customer
-  for (const [cardNo, card] of customer.cards) {
-    
-    // 1. Render transaction HTML natively
-    const txHtml = renderCardTransactions(card);
-    const txBuffer = await getPuppeteerPdf(browser, txHtml, fileName, false);
-    
-    // Parse the generated transaction PDF just to discover Chrome's page count
-    const txPdfDoc = await PDFDocument.load(txBuffer);
-    const pageCount = txPdfDoc.getPageCount();
+  // Phase 2: Extract page boundaries per card using CARD_MARKER text
+  const parser = new pdfParse.PDFParse({ data: massiveTxBuffer });
+  const parsedTxPdf = await parser.getText();
+  const pagesText = parsedTxPdf.pages.map(p => p.text);
 
-    // 2. Render overlays HTML optimally formatted for the discovered pageCount
-    const overlayHtml = renderCardOverlays(card, pageCount);
-    const overlayBuffer = await getPuppeteerPdf(browser, overlayHtml, fileName, true);
-    
-    // 3. Extract pages as XObjects 
-    const pageIndices = Array.from({ length: pageCount }, (_, i) => i);
-    const embeddedTxPages = await finalPdfDoc.embedPdf(txBuffer, pageIndices);
-    const embeddedOverlayPages = await finalPdfDoc.embedPdf(overlayBuffer, pageIndices);
+  const cardsPageCounts = [];
+  let currentCardLength = 0;
+  let currentCardIdx = 0;
 
-    // 4. Stamp them all together into the master document
-    for (let i = 0; i < pageCount; i++) {
-        const isAbsoluteLast = (i === pageCount - 1);
-        const embeddedBg = isAbsoluteLast ? embeddedBgLast : embeddedBgRep;
-        
-        const newPage = finalPdfDoc.addPage([bgDimensions.width, bgDimensions.height]);
-
-        // Stamp 1: Background Template (repPage or lastPage image)
-        newPage.drawPage(embeddedBg, {
-          x: 0,
-          y: 0,
-          width: bgDimensions.width,
-          height: bgDimensions.height
-        });
-
-        // Stamp 2: Transactions (Text layout from Chrome)
-        newPage.drawPage(embeddedTxPages[i], {
-          x: 0,
-          y: 0,
-          width: newPage.getWidth(),
-          height: newPage.getHeight()
-        });
-
-        // Stamp 3: Overlays (Absolute HTML Template Overlays)
-        newPage.drawPage(embeddedOverlayPages[i], {
-          x: 0,
-          y: 0,
-          width: newPage.getWidth(),
-          height: newPage.getHeight()
-        });
+  for (let i = 0; i < pagesText.length; i++) {
+    const pageText = pagesText[i];
+    if (!pageText.trim() && i === pagesText.length - 1) continue;
+    currentCardLength++;
+    if (pageText.includes(`CARD_MARKER_${currentCardIdx}`)) {
+      cardsPageCounts.push(currentCardLength);
+      currentCardLength = 0;
+      currentCardIdx++;
     }
   }
 
-  // Ensure output directory exists before writing
-  const outputDir = subFolder ? `output/pdf/${subFolder}` : "output/pdf";
-  if (!fs.existsSync(outputDir)) {
-    fs.mkdirSync(outputDir, { recursive: true });
+  // Fallback in case of parsing drift
+  while (cardsPageCounts.length < cardsArray.length) {
+    cardsPageCounts.push(1);
   }
 
-  // Write final PDF to disk
-  const finalPdfBytes = await finalPdfDoc.save();
+  // Phase 3: Render overlays with known page counts
+  const massiveOverlayHtml = renderMassiveOverlays(cardsArray, cardsPageCounts);
+  const massiveOverlayBuffer = await getPuppeteerPdf(browser, massiveOverlayHtml, fileName, "overlay");
+
+  // Stitch: bg + transactions + overlays
+  const finalPdfDoc = await PDFDocument.create();
+
+  // Load bg fresh per call — sharing one instance across concurrent tasks causes race conditions
+  const bgPdfDoc = await PDFDocument.load(bgPdfBytes);
+  const embeddedBgRep  = await finalPdfDoc.embedPage(bgPdfDoc.getPage(0));
+  const embeddedBgLast = await finalPdfDoc.embedPage(bgPdfDoc.getPage(1));
+  const bgDimensions = bgPdfDoc.getPage(0).getSize();
+
+  const totalTxPages = cardsPageCounts.reduce((a, b) => a + b, 0);
+  const embeddedTxPages      = await finalPdfDoc.embedPdf(massiveTxBuffer,      Array.from({ length: totalTxPages }, (_, i) => i));
+  const embeddedOverlayPages = await finalPdfDoc.embedPdf(massiveOverlayBuffer, Array.from({ length: totalTxPages }, (_, i) => i));
+
+  let globalPageIdx = 0;
+  for (let cardIdx = 0; cardIdx < cardsArray.length; cardIdx++) {
+    const cardPages = cardsPageCounts[cardIdx];
+    for (let i = 0; i < cardPages; i++) {
+      const embeddedBg = (i === cardPages - 1) ? embeddedBgLast : embeddedBgRep;
+      const newPage = finalPdfDoc.addPage([bgDimensions.width, bgDimensions.height]);
+
+      newPage.drawPage(embeddedBg,                         { x: 0, y: 0, width: bgDimensions.width, height: bgDimensions.height });
+      if (globalPageIdx < embeddedTxPages.length)      newPage.drawPage(embeddedTxPages[globalPageIdx],      { x: 0, y: 0, width: newPage.getWidth(), height: newPage.getHeight() });
+      if (globalPageIdx < embeddedOverlayPages.length) newPage.drawPage(embeddedOverlayPages[globalPageIdx], { x: 0, y: 0, width: newPage.getWidth(), height: newPage.getHeight() });
+
+      globalPageIdx++;
+    }
+  }
+
+  const outputDir = subFolder ? `output/pdf/${subFolder}` : "output/pdf";
+  if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir, { recursive: true });
+
+  // useObjectStreams compresses the cross-reference table for additional savings
+  const finalPdfBytes = await finalPdfDoc.save({ useObjectStreams: true });
   await fs.promises.writeFile(`${outputDir}/${fileName}.pdf`, finalPdfBytes);
 }

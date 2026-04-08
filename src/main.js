@@ -2,7 +2,7 @@ import puppeteer from "puppeteer";
 import fs from "fs";
 import path from "path";
 import { Console } from "console";
-import { PDFDocument } from "pdf-lib";
+
 
 // Create write streams that append ("a") to the log files
 const logStream = fs.createWriteStream("logs.txt", { flags: "a" });
@@ -28,9 +28,8 @@ async function main() {
   const browser = await puppeteer.launch();
 
   try {
-    // Load and parse the background PDF template into a PDFDocument ONLY ONCE
+    // Read background PDF bytes once — each generatePDF call loads its own PDFDocument to avoid concurrency issues
     const bgPdfBytes = fs.readFileSync("images/VISAL_NewLogo_1.pdf");
-    const parsedBgPdfDoc = await PDFDocument.load(bgPdfBytes);
 
     const dataDir = "data";
     const files = fs.readdirSync(dataDir).filter(f => f.toLowerCase().endsWith(".csv"));
@@ -68,7 +67,7 @@ async function main() {
               const fileName = `${brNo}${cif}`;
               
               // Now we pass the entire customer object to the generator so it can handle multi-card native pagination
-              await generatePDF(browser, parsedBgPdfDoc, customer, fileName, subFolder);
+              await generatePDF(browser, bgPdfBytes, customer, fileName, subFolder);
               console.log("Generated:", fileName);
             } catch (err) {
               console.error(`Error generating PDF for ${cif} in ${file}:`, err);
